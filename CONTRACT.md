@@ -33,6 +33,9 @@ Lifecycle operations accept only session names or stable session IDs.
 Text must be a nonempty string without control characters except tab.
 It is literal data, never interpreted by the controller. `send` does not
 append Enter; `type` sends literal text and then a separate Enter invocation.
+Literal text uses a unique named stdin-loaded tmux buffer, preserving trailing
+semicolons. If the Enter call fails after text delivery, the error envelope
+includes `details` with `sent`, `submitted: false`, and `completion: "unknown"`.
 The controller never selects a shell command for a new session: tmux starts
 its configured default shell. Text length is limited to 65536 characters.
 Keys: Enter, Tab, Escape, BSpace, Space, Up, Down, Left, Right, Home, End,

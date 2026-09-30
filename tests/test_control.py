@@ -46,13 +46,23 @@ class ValidationTests(unittest.TestCase):
         from kilix_tmux.control import ControlError
         sessions = [{"id": "$1", "name": "fixture", "panes": [{"id": "%2"}]}]
         with patch("kilix_tmux.control._snapshot", return_value=sessions), \
-             patch("kilix_tmux.control._run", side_effect=["", ControlError("ETMUX", "lost pane")]) as run:
+             patch("kilix_tmux.control._send_literal") as send, \
+             patch("kilix_tmux.control._run", side_effect=ControlError("ETMUX", "lost pane")) as run:
             response = dispatch({"operation": "type", "socket": "/tmp/unused", "target": "fixture", "text": "hello"})
         self.assertFalse(response["ok"])
         self.assertEqual(response["details"]["sent"], 5)
         self.assertFalse(response["details"]["submitted"])
-        self.assertEqual(run.call_args_list[0].args[-3:], ("-l", "--", "hello"))
-        self.assertEqual(run.call_args_list[1].args[-1], "Enter")
+        send.assert_called_once_with("/tmp/unused", "%2", "hello")
+        self.assertEqual(run.call_args.args[-1], "Enter")
+
+    def test_buffer_failure_cleans_up_and_does_not_enter(self):
+        from kilix_tmux.control import ControlError, _send_literal
+        with patch("kilix_tmux.control._run", side_effect=["", ControlError("ETMUX", "lost pane"), ""]) as run:
+            with self.assertRaises(ControlError):
+                _send_literal("/tmp/unused", "%2", "literal;")
+        self.assertEqual(run.call_args_list[0].kwargs["input_text"], "literal;")
+        self.assertEqual(run.call_args_list[0].args[1], "load-buffer")
+        self.assertEqual(run.call_args_list[-1].args[1], "delete-buffer")
 
 
 @unittest.skipUnless(__import__("shutil").which("tmux"), "tmux unavailable")
@@ -88,7 +98,7 @@ class PrivateServerTests(unittest.TestCase):
     def await_receipt(self, path, expected):
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            if path.exists() and path.read_text() == expected:
+            if path.exists() and path.read_bytes() == expected.encode():
                 return
             time.sleep(.02)
         self.fail(f"no target execution receipt: {path}")
@@ -137,6 +147,26 @@ class PrivateServerTests(unittest.TestCase):
         self.assertTrue(result["submitted"])
         self.assertEqual(result["completion"], "unknown")
         self.await_receipt(receipt, "✓ done")
+
+    def test_trailing_semicolon_preserved_byte_for_byte_without_enter(self):
+        # A raw reader records bytes received by the target, independent of
+        # capture-pane rendering or shell echo. No benchmark prompts here.
+        receipt = self.directory / "bytes"
+        reader = self.directory / "reader.py"
+        reader.write_text("import os, tty\nfrom pathlib import Path\ntty.setraw(0)\n"
+                          f"p=Path({str(receipt)!r})\n"
+                          "while True:\n b=os.read(0,1)\n with p.open('ab') as f: f.write(b)\n")
+        pane = self.tmux("new-window", "-d", "-t", "=fixture:", "-P", "-F", "#{pane_id}",
+                         f"{shlex.quote(sys.executable)} -u {shlex.quote(str(reader))}").strip()
+        time.sleep(.1)
+        payload = "literal $HOME `never_run` 'quotes' ✓;"
+        result = self.call("send", target=pane, text=payload)
+        self.assertFalse(result["submitted"])
+        self.await_receipt(receipt, payload)
+        self.assertEqual(receipt.read_bytes(), payload.encode())
+        result = self.call("type", target=pane, text=payload)
+        self.assertTrue(result["submitted"])
+        self.await_receipt(receipt, payload + payload + "\r")
 
     def test_ambiguous_session_refused_explicit_panes_work(self):
         self.tmux("split-window", "-d", "-t", "=fixture:", "/bin/bash --noprofile --norc")

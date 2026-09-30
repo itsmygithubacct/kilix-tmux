@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
+import secrets
 import subprocess
 
 SCHEMA = "kilix.tmux/v1"
@@ -98,15 +99,16 @@ def _validate(request):
     return req
 
 
-def _run(socket, *args, allow_absent=False):
+def _run(socket, *args, allow_absent=False, input_text=None):
     # Never inherit a client context, and never choose a server from TMUX.
     env = dict(os.environ)
     env.pop("TMUX", None)
     try:
+        io = {"stdin": subprocess.DEVNULL} if input_text is None else {"input": input_text}
         result = subprocess.run(["tmux", "-S", socket, *args],
                                 capture_output=True, text=True,
                                 errors="replace", timeout=5,
-                                stdin=subprocess.DEVNULL, env=env)
+                                env=env, **io)
     except FileNotFoundError:
         raise ControlError("ETMUX", "tmux executable not found") from None
     except subprocess.TimeoutExpired:
@@ -120,6 +122,22 @@ def _run(socket, *args, allow_absent=False):
             return None
         raise ControlError("ENOSERVER" if absent else "ETMUX", error or "tmux command failed")
     return result.stdout
+
+
+def _send_literal(socket, target, text):
+    # Derived from tmux-cli paste_buffer. tmux's command parser strips a
+    # trailing semicolon even from send-keys -l argv. Stdin buffer loading
+    # keeps payload bytes out of that parser. Never share the latest buffer.
+    buffer = f"kilix-tmux-{os.getpid()}-{secrets.token_hex(16)}"
+    _run(socket, "load-buffer", "-b", buffer, "-", input_text=text)
+    try:
+        _run(socket, "paste-buffer", "-d", "-b", buffer, "-t", target)
+    except ControlError:
+        try:
+            _run(socket, "delete-buffer", "-b", buffer)
+        except ControlError:
+            pass
+        raise
 
 
 def _snapshot(socket):
@@ -231,7 +249,7 @@ def _execute(req):
         kept = kept[-req["lines"]:]
         return dict(data, text="\n".join(kept) + ("\n" if kept else ""), lines=req["lines"])
     if op in {"send", "type"}:
-        _run(socket, "send-keys", "-t", resolved, "-l", "--", req["text"])
+        _send_literal(socket, resolved, req["text"])
         data.update(sent=len(req["text"]), submitted=False)
         if op == "type":
             try:
