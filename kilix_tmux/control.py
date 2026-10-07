@@ -6,22 +6,27 @@ See PROVENANCE.md and LICENSE for the source revision and copyright.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import re
 import secrets
 import subprocess
+import time
 
 SCHEMA = "kilix.tmux/v1"
 REQUEST_SCHEMA = "kilix.tmux.request/v1"
 KEYS = frozenset("Enter Tab Escape BSpace Space Up Down Left Right Home End "
                  "PageUp PageDown Delete C-c C-d C-u C-a C-e C-l".split())
 FIELDS = {
-    "list": set(), "new": {"name", "cwd"}, "read": {"target", "lines"},
-    "send": {"target", "text"}, "type": {"target", "text"},
+    "list": set(), "new": {"name", "cwd"}, "read": {"target", "lines", "since", "max_bytes"},
+    "send": {"target", "text"}, "type": {"target", "text", "wait", "max_bytes"},
     "key": {"target", "keys"}, "rename": {"target", "new_name"},
     "close": {"target"},
 }
+MAX_WAIT = 600
+WAIT_MAX_BYTES = 10000  # default output cap for type with wait
+_CURSOR = re.compile(r"(\d{1,10}):(\d{1,10}):([0-9a-f]{8})\Z")
 EXITS = {"EUSAGE": 2, "ENOENT": 3, "EEXIST": 4, "ETIMEDOUT": 5,
          "ENOSERVER": 6, "ETMUX": 7, "EAMBIGUOUS": 8}
 _NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,127}\Z")
@@ -80,15 +85,32 @@ def _validate(request):
                     _PANE_ID.fullmatch(target) or _INDEX_TARGET.fullmatch(target))))):
             _usage("target must be an exact session name/ID or an explicit I/O pane target")
     if op == "read":
-        lines = req.get("lines", 80)
-        if type(lines) is not int or not 1 <= lines <= 2000:
-            _usage("lines must be an integer from 1 to 2000")
-        req["lines"] = lines
+        if "since" in req:
+            if "lines" in req:
+                _usage("since and lines are mutually exclusive")
+            if not isinstance(req["since"], str) or not _CURSOR.fullmatch(req["since"]):
+                _usage("since must be a cursor returned by an earlier read or type")
+        else:
+            lines = req.get("lines", 80)
+            if type(lines) is not int or not 1 <= lines <= 2000:
+                _usage("lines must be an integer from 1 to 2000")
+            req["lines"] = lines
+    if "max_bytes" in req:
+        if type(req["max_bytes"]) is not int or not 256 <= req["max_bytes"] <= 1048576:
+            _usage("max_bytes must be an integer from 256 to 1048576")
+        if op == "type" and "wait" not in req:
+            _usage("max_bytes on type requires wait")
+    if op == "type" and "wait" in req:
+        wait = req["wait"]
+        if type(wait) not in (int, float) or not 0 < wait <= MAX_WAIT:
+            _usage(f"wait must be a number of seconds above 0 and at most {MAX_WAIT}")
     if op in {"send", "type"}:
         value = req.get("text")
         if (not isinstance(value, str) or not value or len(value) > 65536
                 or any((ord(c) < 32 and c != "\t") or ord(c) == 127 for c in value)):
             _usage("text must be nonempty literal text, at most 65536 characters, without control characters except tab")
+        if op == "type" and "wait" in req and len(_with_sentinel(value, "0" * 16)) > 65536:
+            _usage("text is too long to append the completion sentinel")
     if op == "key":
         keys = req.get("keys")
         if (not isinstance(keys, list) or not 1 <= len(keys) <= 16
@@ -138,6 +160,165 @@ def _send_literal(socket, target, text):
         except ControlError:
             pass
         raise
+
+
+def _limit(text, max_bytes):
+    # Keep the first and last halves, as Terminus-2 does for observations;
+    # an agent needs the command echo and the final lines most.
+    raw = text.encode("utf-8")
+    if max_bytes is None or len(raw) <= max_bytes:
+        return text, 0
+    half = max_bytes // 2
+    omitted = len(raw) - 2 * half
+    head = raw[:half].decode("utf-8", "ignore")
+    tail = raw[-half:].decode("utf-8", "ignore")
+    return f"{head}\n[... {omitted} bytes omitted by kilix-tmux ...]\n{tail}", omitted
+
+
+def _state(socket, pane):
+    text = _run(socket, "display-message", "-p", "-t", pane,
+                "#{history_size}\t#{history_limit}\t#{cursor_y}\t#{alternate_on}\t#{pane_height}")
+    try:
+        hist, limit, cursor_y, alternate, height = (int(v) for v in text.strip().split("\t"))
+    except ValueError:
+        raise ControlError("ETMUX", f"invalid pane state: {text.strip()!r}") from None
+    return {"hist": hist, "limit": limit, "cy": cursor_y, "alt": bool(alternate), "height": height}
+
+
+def _row(socket, pane, state, absolute):
+    # One physical row by absolute position (history rows first, then the
+    # visible screen); None when it is no longer, or not yet, in the pane.
+    relative = absolute - state["hist"]
+    if absolute < 0 or relative < -state["hist"] or relative >= state["height"]:
+        return None
+    return _run(socket, "capture-pane", "-p", "-t", pane, "-S", str(relative), "-E", str(relative)).rstrip("\n")
+
+
+def _anchor(row):
+    return hashlib.sha256((row or "").rstrip().encode()).hexdigest()[:8]
+
+
+def _cursor(socket, pane, state):
+    # A cursor names the cursor row by absolute position, the history size
+    # then, and a hash of the complete row above it. Clearing, history
+    # trimming at history-limit and reflow change one of them, so a stale
+    # cursor is detected instead of silently skipping or repeating lines.
+    absolute = state["hist"] + state["cy"]
+    return f"{absolute}:{state['hist']}:{_anchor(_row(socket, pane, state, absolute - 1))}"
+
+
+_ECHO = re.compile(r" ?;? printf '\\n__KT_%s_%s__\\n' [0-9a-f]{16} \"\$\?\"")
+_MARK = re.compile(r"__KT_[0-9a-f]{16}_\d+__\Z")
+
+
+def _trim(text):
+    kept = text.split("\n")
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return kept
+
+
+def _clean(rows):
+    # Remove this module's own completion artefacts (the sentinel appended to
+    # echoed command lines, and each marker row with the blank row before it)
+    # and the trailing padding full-screen programs write to every row.
+    kept = []
+    for row in rows:
+        if _MARK.fullmatch(row.strip()):
+            if kept and not kept[-1].strip():
+                kept.pop()
+            continue
+        kept.append(_ECHO.sub("", row).rstrip())
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return kept
+
+
+def _since(socket, pane, cursor):
+    """New rows from a cursor's row to the current cursor row, or the visible
+    screen with a reason when rows cannot be located reliably."""
+    absolute, hist_then, anchor = _CURSOR.fullmatch(cursor).groups()
+    absolute, hist_then = int(absolute), int(hist_then)
+    for _ in range(3):
+        state = _state(socket, pane)
+        if state["alt"]:
+            reason = "alternate_screen"
+        elif (state["hist"] < hist_then or absolute > state["hist"] + state["cy"]
+              or _anchor(_row(socket, pane, state, absolute - 1)) != anchor):
+            reason = "cursor_lost"
+        else:
+            reason = None
+        if reason:
+            text = _run(socket, "capture-pane", "-p", "-J", "-t", pane)
+            after = _state(socket, pane)
+            return {"kind": "screen", "reason": reason, "rows": _trim(text),
+                    "cursor": _cursor(socket, pane, after)}
+        text = _run(socket, "capture-pane", "-p", "-J", "-t", pane,
+                    "-S", str(absolute - state["hist"]), "-E", str(state["cy"]))
+        after = _state(socket, pane)
+        if (after["hist"], after["cy"]) == (state["hist"], state["cy"]):
+            return {"kind": "since", "rows": _trim(text), "cursor": _cursor(socket, pane, after)}
+    raise ControlError("ETMUX", "pane kept scrolling while reading; read again")
+
+
+def _with_sentinel(text, token):
+    # Appended to a single command line for a POSIX shell. A line ending in
+    # one & is already terminated and `& ;` is a syntax error; so is `;;`.
+    body = text.rstrip()
+    separator = " " if (body.endswith("&") and not body.endswith("&&")) or body.endswith(";") else "; "
+    return f"{body}{separator}printf '\\n__KT_%s_%s__\\n' {token} \"$?\""
+
+
+def _wait(socket, pane, start, token, deadline):
+    # The shell's echo of the typed line holds the token and a %s format,
+    # never token_digits, so only the printed marker matches. If the command
+    # cleared the screen, _since falls back to the visible screen, which is
+    # where the marker then appears.
+    marker = re.compile(rf"__KT_{token}_(\d+)__")
+    pause = .05
+    while True:
+        result = _since(socket, pane, start)
+        for index, row in enumerate(result["rows"]):
+            found = marker.search(row)
+            if found:
+                return int(found[1]), result, index
+        if time.monotonic() >= deadline:
+            return None, result, None
+        time.sleep(pause)
+        pause = min(pause * 2, .25)
+
+
+def _type_and_wait(socket, pane, req, data):
+    token = secrets.token_hex(8)
+    start = _cursor(socket, pane, _state(socket, pane))
+    began = time.monotonic()
+    _send_literal(socket, pane, _with_sentinel(req["text"], token))
+    data.update(sent=len(req["text"]), submitted=False)
+    try:
+        _run(socket, "send-keys", "-t", pane, "Enter")
+    except ControlError as exc:
+        exc.details = dict(data, completion="unknown")
+        raise
+    data["submitted"] = True
+    exit_code, result, index = _wait(socket, pane, start, token, began + req["wait"])
+    rows = result["rows"]
+    if exit_code is None:
+        data.update(completion="timeout", kind=result["kind"])
+        if result["kind"] == "since":
+            rows = rows[1:]  # the echoed command line
+    else:
+        data.update(completion="done", exit_code=exit_code, kind=result["kind"])
+        rows = rows[1 if result["kind"] == "since" else 0:index]
+        if rows and not rows[-1].strip():
+            rows = rows[:-1]  # the newline printed ahead of the marker
+    if result.get("reason"):
+        data["reason"] = result["reason"]
+    rows = _clean(rows)
+    output, omitted = _limit("\n".join(rows) + ("\n" if rows else ""), req.get("max_bytes", WAIT_MAX_BYTES))
+    after = _state(socket, pane)
+    data.update(output=output, truncated=bool(omitted), omitted_bytes=omitted,
+                seconds=round(time.monotonic() - began, 2), cursor=_cursor(socket, pane, after))
+    return data
 
 
 def _snapshot(socket):
@@ -240,14 +421,24 @@ def _execute(req):
         return dict(data, session=dict(session, name=req["new_name"]))
     data["target"] = resolved
     if op == "read":
-        text = _run(socket, "capture-pane", "-t", resolved, "-p", "-J", "-S", f"-{req['lines']}")
-        # tmux-cli bounded capture: remove blank viewport padding and retain
-        # the requested final lines, including a trailing newline if nonempty.
-        kept = text.split("\n")
-        while kept and not kept[-1].strip():
-            kept.pop()
-        kept = kept[-req["lines"]:]
-        return dict(data, text="\n".join(kept) + ("\n" if kept else ""), lines=req["lines"])
+        if "since" in req:
+            result = _since(socket, resolved, req["since"])
+            kept = _clean(result["rows"])
+            data.update(kind=result["kind"], cursor=result["cursor"])
+            if "reason" in result:
+                data["reason"] = result["reason"]
+        else:
+            state = _state(socket, resolved)
+            text = _run(socket, "capture-pane", "-t", resolved, "-p", "-J", "-S", f"-{req['lines']}")
+            # tmux-cli bounded capture: remove blank viewport padding and retain
+            # the requested final lines, including a trailing newline if nonempty.
+            kept = _clean(_trim(text))[-req["lines"]:]
+            data.update(lines=req["lines"], kind="lines", alternate_screen=state["alt"],
+                        cursor=_cursor(socket, resolved, state))
+        text, omitted = _limit("\n".join(kept) + ("\n" if kept else ""), req.get("max_bytes"))
+        return dict(data, text=text, truncated=bool(omitted), omitted_bytes=omitted)
+    if op == "type" and "wait" in req:
+        return _type_and_wait(socket, resolved, req, data)
     if op in {"send", "type"}:
         _send_literal(socket, resolved, req["text"])
         data.update(sent=len(req["text"]), submitted=False)

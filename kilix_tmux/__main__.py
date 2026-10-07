@@ -28,9 +28,16 @@ def main(argv=None):
         sub = subs.add_parser(verb, parents=[common])
         sub.add_argument("target")
         if verb == "read":
-            sub.add_argument("--lines", type=int, default=80)
+            sub.add_argument("--lines", type=int, default=argparse.SUPPRESS, help="final lines to return (default 80)")
+            sub.add_argument("--since", default=argparse.SUPPRESS, help="cursor from an earlier read or type: return only new rows")
         if verb in {"send", "type"}:
             sub.add_argument("text", help="one quoted literal string; send does not append Enter")
+        if verb == "type":
+            sub.add_argument("--wait", type=float, default=argparse.SUPPRESS,
+                             help="seconds to wait for the shell command to finish; reports exit_code and output")
+        if verb in {"read", "type"}:
+            sub.add_argument("--max-bytes", dest="max_bytes", type=int, default=argparse.SUPPRESS,
+                             help="cap returned text, keeping the first and last halves")
         if verb == "key":
             sub.add_argument("keys", nargs="+")
         if verb == "rename":

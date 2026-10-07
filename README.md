@@ -10,6 +10,8 @@ Run directly from a checkout:
 bin/kilix-tmux --socket /absolute/path/to/socket --json list
 bin/kilix-tmux --socket /absolute/path/to/socket --json new example
 bin/kilix-tmux --socket /absolute/path/to/socket --json read example --lines 40
+bin/kilix-tmux --socket /absolute/path/to/socket --json type example 'make test' --wait 120
+bin/kilix-tmux --socket /absolute/path/to/socket --json read example --since CURSOR --max-bytes 10000
 bin/kilix-tmux --socket /absolute/path/to/socket --json --dry-run close example
 ```
 
@@ -17,7 +19,11 @@ The socket is always required. Listing returns stable session and pane IDs.
 Names match exactly; I/O on a session with several panes requires an explicit
 pane ID or numeric window/pane target. `send` sends literal text without Enter;
 `type` sends text followed by a separate Enter and reports submission, with
-completion unknown. `key` accepts a limited set of named keys. Dry runs validate
+completion unknown unless `--wait SECONDS` is given: then it waits for the shell
+command to finish and returns `exit_code` and its `output`. Every read returns a
+`cursor`; `read --since CURSOR` returns only the new rows, or the visible screen
+while a full-screen program runs. `--max-bytes` keeps the first and last
+halves. `key` accepts a limited set of named keys. Dry runs validate
 and resolve without changing a session.
 
 ```python
